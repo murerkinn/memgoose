@@ -1046,7 +1046,20 @@ export class Model<T extends object = Record<string, unknown>> {
     return finalResults
   }
 
-  async create(doc: DeepPartial<T>): Promise<T & Document> {
+  async create(docs: DeepPartial<T>[]): Promise<Array<T & Document>>
+  async create(doc: DeepPartial<T>): Promise<T & Document>
+  async create(
+    docOrDocs: DeepPartial<T> | DeepPartial<T>[]
+  ): Promise<(T & Document) | Array<T & Document>> {
+    // Mongoose parity: create(docs[]) creates each document in order
+    if (Array.isArray(docOrDocs)) {
+      const created: Array<T & Document> = []
+      for (const doc of docOrDocs) {
+        created.push(await this.create(doc))
+      }
+      return created
+    }
+    const doc = docOrDocs
     await this._ensureStorageReady()
 
     // Apply setters first (before defaults, validation, etc.)
