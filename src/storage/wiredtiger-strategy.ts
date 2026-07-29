@@ -521,7 +521,11 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
         if (oldKey !== null) {
           const oldBucket = indexMeta.map.get(oldKey)
           if (oldBucket) {
-            const idx = oldBucket.indexOf(oldDoc)
+            // oldDoc may be a pre-update snapshot (a clone) — the bucket then
+            // holds the live, mutated-in-place document instead. Remove
+            // whichever reference is present.
+            let idx = oldBucket.indexOf(oldDoc)
+            if (idx === -1 && newDoc) idx = oldBucket.indexOf(newDoc)
             if (idx > -1) {
               oldBucket.splice(idx, 1)
               if (oldBucket.length === 0) {
@@ -534,7 +538,8 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
 
         if (!removed) {
           for (const [key, bucket] of indexMeta.map.entries()) {
-            const idx = bucket.indexOf(oldDoc)
+            let idx = bucket.indexOf(oldDoc)
+            if (idx === -1 && newDoc && newDoc !== oldDoc) idx = bucket.indexOf(newDoc)
             if (idx > -1) {
               bucket.splice(idx, 1)
               if (bucket.length === 0) {

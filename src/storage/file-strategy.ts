@@ -662,7 +662,11 @@ export class FileStorageStrategy<T extends object> implements StorageStrategy<T>
         const oldKey = indexMeta.fields.map(f => String(oldDoc[f])).join(':')
         const oldBucket = indexMeta.map.get(oldKey)
         if (oldBucket) {
-          const idx = oldBucket.indexOf(oldDoc)
+          // oldDoc may be a pre-update snapshot (a clone) — the bucket then
+          // holds the live, mutated-in-place document instead. Remove whichever
+          // reference is present, or every indexed update leaks a stale entry.
+          let idx = oldBucket.indexOf(oldDoc)
+          if (idx === -1 && newDoc) idx = oldBucket.indexOf(newDoc)
           if (idx > -1) {
             oldBucket.splice(idx, 1)
             if (oldBucket.length === 0) {
