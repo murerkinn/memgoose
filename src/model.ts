@@ -7,6 +7,7 @@ import { FindQueryBuilder } from './find-query-builder'
 import { QueryableKeys } from './type-utils'
 import { StorageStrategy, MemoryStorageStrategy } from './storage'
 import { Document, type IDocument } from './document'
+import { resolveDocumentPath } from './storage/index-keys'
 import type { Database } from './database'
 import type { AggregationPipeline } from './aggregation'
 
@@ -724,7 +725,8 @@ export class Model<T extends object = Record<string, unknown>> {
     }
 
     return Object.entries(query).every(([key, value]) => {
-      const field = doc[key as keyof T]
+      // Dotted keys resolve into nested documents ('processing.status')
+      const field = (key.includes('.') ? resolveDocumentPath(doc, key) : doc[key as keyof T]) as T[keyof T]
 
       // Fast path: simple equality for non-object values (most common case)
       if (typeof value !== 'object' || value === null) {
