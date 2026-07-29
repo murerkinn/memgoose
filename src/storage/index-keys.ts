@@ -50,3 +50,75 @@ export function computeIndexKeys(
   // Dedupe: a doc with labels ['a', 'a'] must appear once per bucket, not twice
   return [...new Set(keyParts.map(parts => parts.join(':')))]
 }
+
+const FORBIDDEN_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor'])
+
+/** Update paths must never traverse the prototype chain (prototype pollution). */
+function assertSafeDocumentPath(path: string): void {
+  if (path.split('.').some(segment => FORBIDDEN_PATH_SEGMENTS.has(segment))) {
+    throw new Error(`Unsafe document path: ${path}`)
+  }
+}
+
+/**
+ * Non-projecting read for update operators: walks embedded documents and
+ * numeric array indices. Unlike resolveDocumentPath it never projects across
+ * array elements — update paths address exactly one slot.
+ */
+export function getDocumentPathValue(source: unknown, path: string): unknown {
+  assertSafeDocumentPath(path)
+  let current: unknown = source
+  for (const segment of path.split('.')) {
+    if (current === null || current === undefined || typeof current !== 'object') return undefined
+    current = (current as Record<string, unknown>)[segment]
+  }
+  return current
+}
+
+/**
+ * Sets a dotted path, creating intermediate embedded documents as needed —
+ * $set semantics: "If you specify a dotted path for a non-existent field,
+ * $set creates the embedded documents as needed to fulfill the dotted path".
+ */
+export function setDocumentPathValue(
+  target: Record<string, unknown>,
+  path: string,
+  value: unknown
+): void {
+  assertSafeDocumentPath(path)
+  const segments = path.split('.')
+  let current: Record<string, unknown> = target
+  for (let i = 0; i < segments.length - 1; i++) {
+    const next = current[segments[i]]
+    if (next === null || next === undefined || typeof next !== 'object') {
+      const created: Record<string, unknown> = {}
+      current[segments[i]] = created
+      current = created
+    } else {
+      current = next as Record<string, unknown>
+    }
+  }
+  current[segments[segments.length - 1]] = value
+}
+
+/**
+ * Deletes a dotted-path leaf — $unset semantics. On array elements MongoDB
+ * nulls the slot instead of removing it; embedded-document leaves are deleted.
+ */
+export function deleteDocumentPathValue(target: Record<string, unknown>, path: string): void {
+  assertSafeDocumentPath(path)
+  const segments = path.split('.')
+  let current: unknown = target
+  for (let i = 0; i < segments.length - 1; i++) {
+    if (current === null || current === undefined || typeof current !== 'object') return
+    current = (current as Record<string, unknown>)[segments[i]]
+  }
+  if (current === null || current === undefined || typeof current !== 'object') return
+  const leaf = segments[segments.length - 1]
+  if (Array.isArray(current)) {
+    const idx = Number(leaf)
+    if (Number.isInteger(idx) && idx >= 0 && idx < current.length) current[idx] = null
+    return
+  }
+  delete (current as Record<string, unknown>)[leaf]
+}

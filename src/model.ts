@@ -7,7 +7,12 @@ import { FindQueryBuilder } from './find-query-builder'
 import { QueryableKeys } from './type-utils'
 import { StorageStrategy, MemoryStorageStrategy } from './storage'
 import { Document, type IDocument } from './document'
-import { resolveDocumentPath } from './storage/index-keys'
+import {
+  resolveDocumentPath,
+  getDocumentPathValue,
+  setDocumentPathValue,
+  deleteDocumentPathValue
+} from './storage/index-keys'
 import type { Database } from './database'
 import type { AggregationPipeline } from './aggregation'
 
@@ -1253,16 +1258,19 @@ export class Model<T extends object = Record<string, unknown>> {
       if (updateOp.$setOnInsert && opts?.isInsert) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$setOnInsert)) {
-          docAsRecord[key] = value
+          if (key.includes('.')) setDocumentPathValue(docAsRecord, key, value)
+          else docAsRecord[key] = value
           modified = true
         }
       }
 
-      // $set
+      // $set — a dotted path merges into the embedded document (creating
+      // intermediates); a plain object value replaces the field wholesale
       if (updateOp.$set) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$set)) {
-          docAsRecord[key] = value
+          if (key.includes('.')) setDocumentPathValue(docAsRecord, key, value)
+          else docAsRecord[key] = value
           modified = true
         }
       }
@@ -1270,27 +1278,39 @@ export class Model<T extends object = Record<string, unknown>> {
       // $unset
       if (updateOp.$unset) {
         for (const key of Object.keys(updateOp.$unset)) {
-          delete doc[key as keyof T]
+          if (key.includes('.')) {
+            deleteDocumentPathValue(doc as unknown as Record<string, unknown>, key)
+          } else {
+            delete doc[key as keyof T]
+          }
           modified = true
         }
       }
 
-      // $inc
+      // $inc — missing fields start from zero (MongoDB creates the field)
       if (updateOp.$inc) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$inc)) {
-          const currentVal = docAsRecord[key]
-          docAsRecord[key] = Number(currentVal) + Number(value)
+          const currentVal = key.includes('.')
+            ? getDocumentPathValue(docAsRecord, key)
+            : docAsRecord[key]
+          const next = Number(currentVal ?? 0) + Number(value)
+          if (key.includes('.')) setDocumentPathValue(docAsRecord, key, next)
+          else docAsRecord[key] = next
           modified = true
         }
       }
 
-      // $dec
+      // $dec (memgoose extension, mirrors $inc)
       if (updateOp.$dec) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$dec)) {
-          const currentVal = docAsRecord[key]
-          docAsRecord[key] = Number(currentVal) - Number(value)
+          const currentVal = key.includes('.')
+            ? getDocumentPathValue(docAsRecord, key)
+            : docAsRecord[key]
+          const next = Number(currentVal ?? 0) - Number(value)
+          if (key.includes('.')) setDocumentPathValue(docAsRecord, key, next)
+          else docAsRecord[key] = next
           modified = true
         }
       }
@@ -1299,13 +1319,14 @@ export class Model<T extends object = Record<string, unknown>> {
       if (updateOp.$push) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$push)) {
-          const arr = docAsRecord[key]
+          const arr = key.includes('.') ? getDocumentPathValue(docAsRecord, key) : docAsRecord[key]
           if (Array.isArray(arr)) {
             arr.push(value)
             modified = true
           } else if (arr === undefined || arr === null) {
             // MongoDB creates the array when the field is missing
-            docAsRecord[key] = [value]
+            if (key.includes('.')) setDocumentPathValue(docAsRecord, key, [value])
+            else docAsRecord[key] = [value]
             modified = true
           }
         }
@@ -1315,7 +1336,7 @@ export class Model<T extends object = Record<string, unknown>> {
       if (updateOp.$pull) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$pull)) {
-          const arr = docAsRecord[key]
+          const arr = key.includes('.') ? getDocumentPathValue(docAsRecord, key) : docAsRecord[key]
           if (Array.isArray(arr)) {
             const index = arr.indexOf(value)
             if (index > -1) {
@@ -1330,7 +1351,7 @@ export class Model<T extends object = Record<string, unknown>> {
       if (updateOp.$addToSet) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, value] of Object.entries(updateOp.$addToSet)) {
-          const arr = docAsRecord[key]
+          const arr = key.includes('.') ? getDocumentPathValue(docAsRecord, key) : docAsRecord[key]
           if (Array.isArray(arr)) {
             if (!arr.includes(value)) {
               arr.push(value)
@@ -1338,7 +1359,8 @@ export class Model<T extends object = Record<string, unknown>> {
             }
           } else if (arr === undefined || arr === null) {
             // MongoDB creates the array when the field is missing
-            docAsRecord[key] = [value]
+            if (key.includes('.')) setDocumentPathValue(docAsRecord, key, [value])
+            else docAsRecord[key] = [value]
             modified = true
           }
         }
@@ -1348,7 +1370,7 @@ export class Model<T extends object = Record<string, unknown>> {
       if (updateOp.$pop) {
         const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [key, direction] of Object.entries(updateOp.$pop)) {
-          const arr = docAsRecord[key]
+          const arr = key.includes('.') ? getDocumentPathValue(docAsRecord, key) : docAsRecord[key]
           if (Array.isArray(arr) && arr.length > 0) {
             if (direction === 1) {
               arr.pop()
@@ -1362,8 +1384,16 @@ export class Model<T extends object = Record<string, unknown>> {
 
       // $rename
       if (updateOp.$rename) {
+        const docAsRecord = doc as unknown as Record<string, unknown>
         for (const [oldKey, newKey] of Object.entries(updateOp.$rename)) {
-          if (oldKey in doc) {
+          if (oldKey.includes('.') || String(newKey).includes('.')) {
+            const value = getDocumentPathValue(docAsRecord, oldKey)
+            if (value !== undefined) {
+              deleteDocumentPathValue(docAsRecord, oldKey)
+              setDocumentPathValue(docAsRecord, String(newKey), value)
+              modified = true
+            }
+          } else if (oldKey in doc) {
             doc[newKey as keyof T] = doc[oldKey as keyof T]
             delete doc[oldKey as keyof T]
             modified = true
@@ -1499,10 +1529,11 @@ export class Model<T extends object = Record<string, unknown>> {
   private _buildUpsertDocument(query: Query<T>, update: Update<T>): Record<string, unknown> {
     const newDoc = {} as Record<string, unknown>
 
-    // Apply query fields as initial values
+    // Apply query fields as initial values (dotted keys build nested documents)
     for (const [key, value] of Object.entries(query)) {
       if (typeof value !== 'object' || value === null || value instanceof ObjectId) {
-        newDoc[key] = value
+        if (key.includes('.')) setDocumentPathValue(newDoc, key, value)
+        else newDoc[key] = value
       }
     }
 
