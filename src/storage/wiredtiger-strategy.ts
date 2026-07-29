@@ -1,5 +1,6 @@
 import { StorageStrategy, QueryMatcher } from './storage-strategy'
 import { DuplicateKeyError } from '../schema'
+import { computeIndexKeys } from './index-keys'
 import * as path from 'path'
 import * as fs from 'fs'
 
@@ -52,19 +53,10 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
     options?: { unique?: boolean }
   }> = []
 
-  private _computeIndexKey(doc: Partial<T>, fields: Array<keyof T>): string | null {
-    const record = doc as Record<string, unknown>
-    const values: Array<unknown> = []
-
-    for (const field of fields) {
-      const value = record[field as string]
-      if (value === undefined || value === null) {
-        return null
-      }
-      values.push(value)
-    }
-
-    return values.map(value => String(value)).join(':')
+  private _computeIndexKeys(doc: Partial<T>, fields: Array<keyof T>): string[] {
+    // Multikey: array fields expand to one key per element; null/undefined
+    // field values mean the document is not indexed (existing behavior).
+    return computeIndexKeys(doc as Record<string, unknown>, fields, { skipNullish: true })
   }
 
   constructor(options: WiredTigerStorageOptions) {
@@ -471,10 +463,10 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
     // Build in-memory query index map for faster lookups
     const map = new Map<string, T[]>()
     for (const doc of this._data) {
-      const compositeKey = this._computeIndexKey(doc, sortedFields as Array<keyof T>)
-      if (compositeKey === null) continue
-      if (!map.has(compositeKey)) map.set(compositeKey, [])
-      map.get(compositeKey)!.push(doc)
+      for (const compositeKey of this._computeIndexKeys(doc, sortedFields as Array<keyof T>)) {
+        if (!map.has(compositeKey)) map.set(compositeKey, [])
+        map.get(compositeKey)!.push(doc)
+      }
     }
 
     // Store index with metadata
@@ -494,10 +486,10 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
       indexMeta.map.clear()
 
       for (const doc of this._data) {
-        const compositeKey = this._computeIndexKey(doc, indexMeta.fields)
-        if (compositeKey === null) continue
-        if (!indexMeta.map.has(compositeKey)) indexMeta.map.set(compositeKey, [])
-        indexMeta.map.get(compositeKey)!.push(doc)
+        for (const compositeKey of this._computeIndexKeys(doc, indexMeta.fields)) {
+          if (!indexMeta.map.has(compositeKey)) indexMeta.map.set(compositeKey, [])
+          indexMeta.map.get(compositeKey)!.push(doc)
+        }
       }
     }
   }
@@ -515,13 +507,16 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
       // Remove old index entry if document existed before
       if (oldDoc) {
         const removalKeySource = keySources?.old ?? oldDoc
-        const oldKey = this._computeIndexKey(removalKeySource, indexMeta.fields)
         let removed = false
 
-        if (oldKey !== null) {
+        for (const oldKey of this._computeIndexKeys(removalKeySource, indexMeta.fields)) {
           const oldBucket = indexMeta.map.get(oldKey)
           if (oldBucket) {
-            const idx = oldBucket.indexOf(oldDoc)
+            // oldDoc may be a pre-update snapshot (a clone) — the bucket then
+            // holds the live, mutated-in-place document instead. Remove
+            // whichever reference is present.
+            let idx = oldBucket.indexOf(oldDoc)
+            if (idx === -1 && newDoc) idx = oldBucket.indexOf(newDoc)
             if (idx > -1) {
               oldBucket.splice(idx, 1)
               if (oldBucket.length === 0) {
@@ -534,7 +529,8 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
 
         if (!removed) {
           for (const [key, bucket] of indexMeta.map.entries()) {
-            const idx = bucket.indexOf(oldDoc)
+            let idx = bucket.indexOf(oldDoc)
+            if (idx === -1 && newDoc && newDoc !== oldDoc) idx = bucket.indexOf(newDoc)
             if (idx > -1) {
               bucket.splice(idx, 1)
               if (bucket.length === 0) {
@@ -549,8 +545,7 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
       // Add new index entry if document exists after
       if (newDoc) {
         const insertionKeySource = keySources?.new ?? newDoc
-        const newKey = this._computeIndexKey(insertionKeySource, indexMeta.fields)
-        if (newKey !== null) {
+        for (const newKey of this._computeIndexKeys(insertionKeySource, indexMeta.fields)) {
           if (!indexMeta.map.has(newKey)) {
             indexMeta.map.set(newKey, [])
           }
@@ -565,18 +560,17 @@ export class WiredTigerStorageStrategy<T extends object> implements StorageStrat
     for (const indexMeta of this._queryIndexes.values()) {
       if (!indexMeta.unique) continue
 
-      // Build composite key from document values
-      const compositeKey = this._computeIndexKey(doc, indexMeta.fields)
-      if (compositeKey === null) continue
+      // Build composite key(s) from document values (multikey for array fields)
+      for (const compositeKey of this._computeIndexKeys(doc, indexMeta.fields)) {
+        // Check if this combination already exists in the index
+        const existingDocs = indexMeta.map.get(compositeKey) || []
 
-      // Check if this combination already exists in the index
-      const existingDocs = indexMeta.map.get(compositeKey) || []
+        // Filter out the document being updated (if any)
+        const duplicates = excludeDoc ? existingDocs.filter(d => d !== excludeDoc) : existingDocs
 
-      // Filter out the document being updated (if any)
-      const duplicates = excludeDoc ? existingDocs.filter(d => d !== excludeDoc) : existingDocs
-
-      if (duplicates.length > 0) {
-        throw new DuplicateKeyError(indexMeta.fields.map(f => String(f)))
+        if (duplicates.length > 0) {
+          throw new DuplicateKeyError(indexMeta.fields.map(f => String(f)))
+        }
       }
     }
   }

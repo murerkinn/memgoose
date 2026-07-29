@@ -7,6 +7,7 @@ import { FindQueryBuilder } from './find-query-builder'
 import { QueryableKeys } from './type-utils'
 import { StorageStrategy, MemoryStorageStrategy } from './storage'
 import { Document, type IDocument } from './document'
+import { resolveDocumentPath } from './storage/index-keys'
 import type { Database } from './database'
 import type { AggregationPipeline } from './aggregation'
 
@@ -61,6 +62,7 @@ export type Query<T extends object = Record<string, unknown>> = {
 // Update operators
 export type UpdateOperator<T extends object = Record<string, unknown>> = {
   $set?: Partial<T>
+  $setOnInsert?: Partial<T>
   $unset?: Partial<Record<keyof T, unknown>>
   $inc?: Partial<Record<keyof T, number>>
   $dec?: Partial<Record<keyof T, number>>
@@ -683,6 +685,16 @@ export class Model<T extends object = Record<string, unknown>> {
       return a === b
     }
 
+    // MongoDB array-field semantics: an array field equals a scalar when any
+    // element equals it ({ labels: 'x' } matches labels: ['x', 'y']), and
+    // equals another array element-wise (exact match).
+    if (Array.isArray(a)) {
+      if (Array.isArray(b)) {
+        return a.length === b.length && a.every((item, i) => this._compareValues(item, b[i]))
+      }
+      return a.some(item => this._compareValues(item, b))
+    }
+
     // Handle ObjectId comparison
     if (a instanceof ObjectId || b instanceof ObjectId) {
       const aStr = a instanceof ObjectId ? a.toString() : String(a)
@@ -713,7 +725,8 @@ export class Model<T extends object = Record<string, unknown>> {
     }
 
     return Object.entries(query).every(([key, value]) => {
-      const field = doc[key as keyof T]
+      // Dotted keys resolve into nested documents ('processing.status')
+      const field = (key.includes('.') ? resolveDocumentPath(doc, key) : doc[key as keyof T]) as T[keyof T]
 
       // Fast path: simple equality for non-object values (most common case)
       if (typeof value !== 'object' || value === null) {
@@ -754,7 +767,8 @@ export class Model<T extends object = Record<string, unknown>> {
               if (v === null) {
                 return field !== null && field !== undefined
               }
-              return field !== v
+              // Array fields: $ne excludes documents whose array contains the value
+              return !this._compareValues(field, v)
             case '$in':
               // MongoDB behavior: $in: [null] matches both null and undefined
               if (Array.isArray(v) && v.includes(null) && (field === null || field === undefined)) {
@@ -1212,7 +1226,7 @@ export class Model<T extends object = Record<string, unknown>> {
   }
 
   // --- Update Operations ---
-  private _applyUpdate(doc: T, update: Update<T>): boolean {
+  private _applyUpdate(doc: T, update: Update<T>, opts?: { isInsert?: boolean }): boolean {
     let modified = false
 
     // Check if update contains operators
@@ -1220,6 +1234,16 @@ export class Model<T extends object = Record<string, unknown>> {
 
     if (hasOperators) {
       const updateOp = update as UpdateOperator<T>
+
+      // $setOnInsert — applied only when the document is being created by an
+      // upsert (MongoDB semantics); ignored on updates of existing documents
+      if (updateOp.$setOnInsert && opts?.isInsert) {
+        const docAsRecord = doc as unknown as Record<string, unknown>
+        for (const [key, value] of Object.entries(updateOp.$setOnInsert)) {
+          docAsRecord[key] = value
+          modified = true
+        }
+      }
 
       // $set
       if (updateOp.$set) {
@@ -1266,6 +1290,10 @@ export class Model<T extends object = Record<string, unknown>> {
           if (Array.isArray(arr)) {
             arr.push(value)
             modified = true
+          } else if (arr === undefined || arr === null) {
+            // MongoDB creates the array when the field is missing
+            docAsRecord[key] = [value]
+            modified = true
           }
         }
       }
@@ -1295,6 +1323,10 @@ export class Model<T extends object = Record<string, unknown>> {
               arr.push(value)
               modified = true
             }
+          } else if (arr === undefined || arr === null) {
+            // MongoDB creates the array when the field is missing
+            docAsRecord[key] = [value]
+            modified = true
           }
         }
       }
@@ -1461,8 +1493,8 @@ export class Model<T extends object = Record<string, unknown>> {
       }
     }
 
-    // Apply the update
-    this._applyUpdate(newDoc as T, update)
+    // Apply the update (isInsert: $setOnInsert fields participate)
+    this._applyUpdate(newDoc as T, update, { isInsert: true })
 
     return newDoc
   }
