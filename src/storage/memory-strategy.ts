@@ -1,5 +1,6 @@
 import { StorageStrategy, QueryMatcher, SchemaRecord } from './storage-strategy'
 import { DuplicateKeyError } from '../schema'
+import { computeIndexKeys } from './index-keys'
 
 // Index metadata structure
 type IndexMetadata<T> = {
@@ -73,12 +74,13 @@ export class MemoryStorageStrategy<T extends object> implements StorageStrategy<
     const sortedFields = [...normalizedFields].sort()
     const indexKey = sortedFields.join(',')
 
-    // Build the index map
+    // Build the index map (multikey: array fields expand to one key per element)
     const map = new Map<string, T[]>()
     for (const doc of this._data) {
-      const compositeKey = sortedFields.map(f => String(doc[f])).join(':')
-      if (!map.has(compositeKey)) map.set(compositeKey, [])
-      map.get(compositeKey)!.push(doc)
+      for (const compositeKey of computeIndexKeys(doc as Record<string, unknown>, sortedFields)) {
+        if (!map.has(compositeKey)) map.set(compositeKey, [])
+        map.get(compositeKey)!.push(doc)
+      }
     }
 
     // Store index with metadata
@@ -95,9 +97,10 @@ export class MemoryStorageStrategy<T extends object> implements StorageStrategy<
       indexMeta.map.clear()
 
       for (const doc of this._data) {
-        const compositeKey = indexMeta.fields.map(f => String(doc[f])).join(':')
-        if (!indexMeta.map.has(compositeKey)) indexMeta.map.set(compositeKey, [])
-        indexMeta.map.get(compositeKey)!.push(doc)
+        for (const compositeKey of computeIndexKeys(doc as Record<string, unknown>, indexMeta.fields)) {
+          if (!indexMeta.map.has(compositeKey)) indexMeta.map.set(compositeKey, [])
+          indexMeta.map.get(compositeKey)!.push(doc)
+        }
       }
     }
   }
@@ -105,11 +108,11 @@ export class MemoryStorageStrategy<T extends object> implements StorageStrategy<
   updateIndexForDocument(oldDoc: T | null, newDoc: T | null): void {
     // Efficiently update indexes for a single document change
     for (const indexMeta of this._indexes.values()) {
-      // Remove old index entry if document existed before
+      // Remove old index entries if document existed before
       if (oldDoc) {
-        const oldKey = indexMeta.fields.map(f => String(oldDoc[f])).join(':')
-        const oldBucket = indexMeta.map.get(oldKey)
-        if (oldBucket) {
+        for (const oldKey of computeIndexKeys(oldDoc as Record<string, unknown>, indexMeta.fields)) {
+          const oldBucket = indexMeta.map.get(oldKey)
+          if (!oldBucket) continue
           // oldDoc may be a pre-update snapshot (a clone) — the bucket then
           // holds the live, mutated-in-place document instead. Remove whichever
           // reference is present, or every indexed update leaks a stale entry.
@@ -124,22 +127,24 @@ export class MemoryStorageStrategy<T extends object> implements StorageStrategy<
         }
       }
 
-      // Add new index entry if document exists after
+      // Add new index entries if document exists after
       if (newDoc) {
-        const newKey = indexMeta.fields.map(f => String(newDoc[f])).join(':')
-        if (!indexMeta.map.has(newKey)) {
-          indexMeta.map.set(newKey, [])
+        for (const newKey of computeIndexKeys(newDoc as Record<string, unknown>, indexMeta.fields)) {
+          if (!indexMeta.map.has(newKey)) {
+            indexMeta.map.set(newKey, [])
+          }
+          indexMeta.map.get(newKey)!.push(newDoc)
         }
-        indexMeta.map.get(newKey)!.push(newDoc)
       }
     }
   }
 
   private _updateIndexes(doc: T): void {
     for (const indexMeta of this._indexes.values()) {
-      const compositeKey = indexMeta.fields.map(f => String(doc[f])).join(':')
-      if (!indexMeta.map.has(compositeKey)) indexMeta.map.set(compositeKey, [])
-      indexMeta.map.get(compositeKey)!.push(doc)
+      for (const compositeKey of computeIndexKeys(doc as Record<string, unknown>, indexMeta.fields)) {
+        if (!indexMeta.map.has(compositeKey)) indexMeta.map.set(compositeKey, [])
+        indexMeta.map.get(compositeKey)!.push(doc)
+      }
     }
   }
 
@@ -148,17 +153,17 @@ export class MemoryStorageStrategy<T extends object> implements StorageStrategy<
     for (const indexMeta of this._indexes.values()) {
       if (!indexMeta.unique) continue
 
-      // Build composite key from document values
-      const compositeKey = indexMeta.fields.map(f => String(doc[f])).join(':')
+      // Build composite key(s) from document values (multikey for array fields)
+      for (const compositeKey of computeIndexKeys(doc as Record<string, unknown>, indexMeta.fields)) {
+        // Check if this combination already exists in the index
+        const existingDocs = indexMeta.map.get(compositeKey) || []
 
-      // Check if this combination already exists in the index
-      const existingDocs = indexMeta.map.get(compositeKey) || []
+        // Filter out the document being updated (if any)
+        const duplicates = excludeDoc ? existingDocs.filter(d => d !== excludeDoc) : existingDocs
 
-      // Filter out the document being updated (if any)
-      const duplicates = excludeDoc ? existingDocs.filter(d => d !== excludeDoc) : existingDocs
-
-      if (duplicates.length > 0) {
-        throw new DuplicateKeyError(indexMeta.fields as string[])
+        if (duplicates.length > 0) {
+          throw new DuplicateKeyError(indexMeta.fields as string[])
+        }
       }
     }
   }

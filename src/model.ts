@@ -683,6 +683,16 @@ export class Model<T extends object = Record<string, unknown>> {
       return a === b
     }
 
+    // MongoDB array-field semantics: an array field equals a scalar when any
+    // element equals it ({ labels: 'x' } matches labels: ['x', 'y']), and
+    // equals another array element-wise (exact match).
+    if (Array.isArray(a)) {
+      if (Array.isArray(b)) {
+        return a.length === b.length && a.every((item, i) => this._compareValues(item, b[i]))
+      }
+      return a.some(item => this._compareValues(item, b))
+    }
+
     // Handle ObjectId comparison
     if (a instanceof ObjectId || b instanceof ObjectId) {
       const aStr = a instanceof ObjectId ? a.toString() : String(a)
@@ -754,7 +764,8 @@ export class Model<T extends object = Record<string, unknown>> {
               if (v === null) {
                 return field !== null && field !== undefined
               }
-              return field !== v
+              // Array fields: $ne excludes documents whose array contains the value
+              return !this._compareValues(field, v)
             case '$in':
               // MongoDB behavior: $in: [null] matches both null and undefined
               if (Array.isArray(v) && v.includes(null) && (field === null || field === undefined)) {
