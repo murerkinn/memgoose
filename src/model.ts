@@ -61,6 +61,7 @@ export type Query<T extends object = Record<string, unknown>> = {
 // Update operators
 export type UpdateOperator<T extends object = Record<string, unknown>> = {
   $set?: Partial<T>
+  $setOnInsert?: Partial<T>
   $unset?: Partial<Record<keyof T, unknown>>
   $inc?: Partial<Record<keyof T, number>>
   $dec?: Partial<Record<keyof T, number>>
@@ -1223,7 +1224,7 @@ export class Model<T extends object = Record<string, unknown>> {
   }
 
   // --- Update Operations ---
-  private _applyUpdate(doc: T, update: Update<T>): boolean {
+  private _applyUpdate(doc: T, update: Update<T>, opts?: { isInsert?: boolean }): boolean {
     let modified = false
 
     // Check if update contains operators
@@ -1231,6 +1232,16 @@ export class Model<T extends object = Record<string, unknown>> {
 
     if (hasOperators) {
       const updateOp = update as UpdateOperator<T>
+
+      // $setOnInsert — applied only when the document is being created by an
+      // upsert (MongoDB semantics); ignored on updates of existing documents
+      if (updateOp.$setOnInsert && opts?.isInsert) {
+        const docAsRecord = doc as unknown as Record<string, unknown>
+        for (const [key, value] of Object.entries(updateOp.$setOnInsert)) {
+          docAsRecord[key] = value
+          modified = true
+        }
+      }
 
       // $set
       if (updateOp.$set) {
@@ -1277,6 +1288,10 @@ export class Model<T extends object = Record<string, unknown>> {
           if (Array.isArray(arr)) {
             arr.push(value)
             modified = true
+          } else if (arr === undefined || arr === null) {
+            // MongoDB creates the array when the field is missing
+            docAsRecord[key] = [value]
+            modified = true
           }
         }
       }
@@ -1306,6 +1321,10 @@ export class Model<T extends object = Record<string, unknown>> {
               arr.push(value)
               modified = true
             }
+          } else if (arr === undefined || arr === null) {
+            // MongoDB creates the array when the field is missing
+            docAsRecord[key] = [value]
+            modified = true
           }
         }
       }
@@ -1472,8 +1491,8 @@ export class Model<T extends object = Record<string, unknown>> {
       }
     }
 
-    // Apply the update
-    this._applyUpdate(newDoc as T, update)
+    // Apply the update (isInsert: $setOnInsert fields participate)
+    this._applyUpdate(newDoc as T, update, { isInsert: true })
 
     return newDoc
   }
