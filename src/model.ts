@@ -81,6 +81,35 @@ export type UpdateOperator<T extends object = Record<string, unknown>> = {
 // Update can be direct field updates or operator-based
 export type Update<T extends object = Record<string, unknown>> = Partial<T> | UpdateOperator<T>
 
+// bulkWrite operation shapes (mongoose / driver parity)
+export type BulkWriteOperation<T extends object = Record<string, unknown>> =
+  | { insertOne: { document: DeepPartial<T> } }
+  | { updateOne: { filter: Query<T>; update: Update<T>; upsert?: boolean } }
+  | { updateMany: { filter: Query<T>; update: Update<T>; upsert?: boolean } }
+  | { deleteOne: { filter: Query<T> } }
+  | { deleteMany: { filter: Query<T> } }
+  | { replaceOne: { filter: Query<T>; replacement: DeepPartial<T>; upsert?: boolean } }
+
+export interface BulkWriteResult {
+  insertedCount: number
+  matchedCount: number
+  modifiedCount: number
+  deletedCount: number
+  upsertedCount: number
+  insertedIds: Record<number, unknown>
+  upsertedIds: Record<number, unknown>
+}
+
+export class BulkWriteError extends Error {
+  constructor(
+    public readonly writeErrors: Array<{ index: number; error: Error }>,
+    public readonly result: BulkWriteResult
+  ) {
+    super(`bulkWrite failed: ${writeErrors.length} write error(s)`)
+    this.name = 'BulkWriteError'
+  }
+}
+
 // Query options
 export type QueryOptions<T extends object = Record<string, unknown>> = {
   sort?: Partial<Record<keyof T, 1 | -1>>
@@ -731,7 +760,9 @@ export class Model<T extends object = Record<string, unknown>> {
 
     return Object.entries(query).every(([key, value]) => {
       // Dotted keys resolve into nested documents ('processing.status')
-      const field = (key.includes('.') ? resolveDocumentPath(doc, key) : doc[key as keyof T]) as T[keyof T]
+      const field = (
+        key.includes('.') ? resolveDocumentPath(doc, key) : doc[key as keyof T]
+      ) as T[keyof T]
 
       // Fast path: simple equality for non-object values (most common case)
       if (typeof value !== 'object' || value === null) {
@@ -1149,6 +1180,183 @@ export class Model<T extends object = Record<string, unknown>> {
     return fullDocs.map(doc => this._applyVirtuals(doc))
   }
 
+  /**
+   * Executes a batch of write operations. Ordered by default: the run stops at
+   * the first failing operation (everything before it is applied). With
+   * { ordered: false } every operation is attempted and failures are collected
+   * into a BulkWriteError. Operations run through the model's regular internal
+   * paths, so the corresponding save/update/delete middleware fires — unlike
+   * mongoose's bulkWrite, which bypasses middleware.
+   */
+  async bulkWrite(
+    operations: BulkWriteOperation<T>[],
+    options?: { ordered?: boolean }
+  ): Promise<BulkWriteResult> {
+    await this._ensureStorageReady()
+    if (operations.length === 0) {
+      throw new Error('Invalid BulkOperation, Batch cannot be empty')
+    }
+    const ordered = options?.ordered !== false
+    const result: BulkWriteResult = {
+      insertedCount: 0,
+      matchedCount: 0,
+      modifiedCount: 0,
+      deletedCount: 0,
+      upsertedCount: 0,
+      insertedIds: {},
+      upsertedIds: {}
+    }
+    const writeErrors: Array<{ index: number; error: Error }> = []
+
+    // A malformed batch (not exactly one recognized own key per op) is a
+    // parse-stage error, not a write error
+    const knownOps = [
+      'insertOne',
+      'updateOne',
+      'updateMany',
+      'deleteOne',
+      'deleteMany',
+      'replaceOne'
+    ]
+    for (const op of operations) {
+      const keys = Object.keys(op)
+      if (keys.length !== 1 || !knownOps.includes(keys[0])) {
+        throw new Error(`unknown bulkWrite operation: ${keys.join(', ') || '(empty)'}`)
+      }
+    }
+
+    for (let index = 0; index < operations.length; index++) {
+      const op = operations[index]
+      try {
+        if ('insertOne' in op) {
+          const created = await this.create(op.insertOne.document)
+          result.insertedCount++
+          result.insertedIds[index] = (created as Record<string, unknown>)._id
+        } else if ('updateOne' in op) {
+          const { filter, update, upsert } = op.updateOne
+          const r = await this._executeUpdateOne(filter, update, { upsert })
+          if (r.upsertedCount) {
+            result.upsertedCount++
+            result.upsertedIds[index] = r.upsertedId
+          } else {
+            result.matchedCount += r.matchedCount ?? 0
+            result.modifiedCount += r.modifiedCount
+          }
+        } else if ('updateMany' in op) {
+          const { filter, update, upsert } = op.updateMany
+          const r = await this._executeUpdateMany(filter, update)
+          // matchedCount === undefined means "unknown", never "zero" — an
+          // unknown count must not trigger an upsert insert
+          if (r.matchedCount === 0 && upsert) {
+            const u = await this._executeUpdateOne(filter, update, { upsert: true })
+            result.upsertedCount++
+            result.upsertedIds[index] = u.upsertedId
+          } else {
+            result.matchedCount += r.matchedCount ?? 0
+            result.modifiedCount += r.modifiedCount
+          }
+        } else if ('deleteOne' in op) {
+          const r = await this._executeDeleteOne(op.deleteOne.filter)
+          result.deletedCount += r.deletedCount
+        } else if ('deleteMany' in op) {
+          const r = await this._executeDeleteMany(op.deleteMany.filter)
+          result.deletedCount += r.deletedCount
+        } else if ('replaceOne' in op) {
+          const { filter, replacement, upsert } = op.replaceOne
+          const r = await this._executeReplaceOne(filter, replacement, { upsert })
+          result.matchedCount += r.matchedCount
+          result.modifiedCount += r.modifiedCount
+          if (r.upsertedId !== undefined) {
+            result.upsertedCount++
+            result.upsertedIds[index] = r.upsertedId
+          }
+        }
+      } catch (error) {
+        writeErrors.push({ index, error: error as Error })
+        if (ordered) break
+      }
+    }
+
+    if (writeErrors.length > 0) {
+      throw new BulkWriteError(writeErrors, result)
+    }
+    return result
+  }
+
+  /** Replace a whole document (bulkWrite replaceOne). The stored _id is immutable. */
+  private async _executeReplaceOne(
+    filter: Query<T>,
+    replacement: DeepPartial<T>,
+    options?: { upsert?: boolean }
+  ): Promise<{ matchedCount: number; modifiedCount: number; upsertedId?: unknown }> {
+    const replacementRecord = { ...(replacement as Record<string, unknown>) }
+    // Prototype-chain keys must never reach a [[Set]] on a live document
+    for (const key of ['__proto__', 'constructor', 'prototype']) {
+      if (Object.prototype.hasOwnProperty.call(replacementRecord, key)) {
+        throw new Error(`Unsafe replacement key: ${key}`)
+      }
+    }
+
+    const docs = await this._findDocumentsUsingIndexes(filter)
+    if (docs.length === 0) {
+      if (options?.upsert) {
+        const created = await this.create(replacement)
+        return {
+          matchedCount: 0,
+          modifiedCount: 0,
+          upsertedId: (created as Record<string, unknown>)._id
+        }
+      }
+      return { matchedCount: 0, modifiedCount: 0 }
+    }
+
+    const doc = docs[0] as Record<string, unknown>
+    if (
+      Object.prototype.hasOwnProperty.call(replacementRecord, '_id') &&
+      String(replacementRecord._id) !== String(doc._id)
+    ) {
+      throw new Error("the (immutable) field '_id' was found to have been altered")
+    }
+    delete replacementRecord._id
+
+    await this._executePreHooks('update', { query: filter, update: replacement as Update<T> })
+
+    // Cast like a fresh document: setters, defaults, timestamps, validation
+    if (this._schema) this._schema.applySetters(replacementRecord as DeepPartial<T>)
+    this._applyDefaults(replacementRecord as T)
+    const testCopy = { _id: doc._id, ...replacementRecord } as T
+    this._applyTimestamps(testCopy, 'create')
+    await this._validateDocument(testCopy)
+    this._checkUniqueConstraints(testCopy, doc as T)
+
+    const oldState = { ...doc } as T
+    for (const key of Object.keys(doc)) {
+      if (key !== '_id') delete doc[key]
+    }
+    for (const [key, value] of Object.entries(replacementRecord)) {
+      Object.defineProperty(doc, key, {
+        value,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      })
+    }
+    // the wipe above also removed the discriminator key — restore it
+    if (this._discriminatorKey && this._discriminatorValue) {
+      ;(doc as Record<string, unknown>)[this._discriminatorKey] = this._discriminatorValue
+    }
+    this._applyTimestamps(doc as T, 'create')
+    await this._storage.update(doc as T, doc as T)
+    this._updateIndexForDocument(oldState, doc as T)
+
+    await this._executePostHooks('update', {
+      query: filter,
+      update: replacement as Update<T>,
+      modifiedCount: 1
+    })
+    return { matchedCount: 1, modifiedCount: 1 }
+  }
+
   // --- Delete Operations ---
   deleteOne(query: Query<T>): QueryBuilder<{ deletedCount: number }> {
     const operation = async () => {
@@ -1164,9 +1372,15 @@ export class Model<T extends object = Record<string, unknown>> {
     // NEW: Use native delete if available
     if (typeof (this._storage as any).deleteNative === 'function') {
       try {
-        // For single delete, add LIMIT 1 to query (SQLite will handle this via UPDATE/DELETE)
-        const result = await (this._storage as any).deleteNative(query)
-        // Limit to 1 for deleteOne semantics
+        // A bare WHERE would delete every match — resolve a single _id first
+        // so native storage removes exactly one row (deleteOne semantics)
+        const candidates = await this._findDocumentsUsingIndexes(query)
+        const target = candidates[0] as Record<string, unknown> | undefined
+        if (!target) {
+          await this._executePostHooks('delete', { query, deletedCount: 0 })
+          return { deletedCount: 0 }
+        }
+        const result = await (this._storage as any).deleteNative({ _id: target._id })
         const deletedCount = Math.min(result.deletedCount, 1)
         await this._executePostHooks('delete', { query, deletedCount })
         return { deletedCount }
@@ -1427,7 +1641,12 @@ export class Model<T extends object = Record<string, unknown>> {
     query: Query<T>,
     update: Update<T>,
     options?: { upsert?: boolean }
-  ): Promise<{ modifiedCount: number; upsertedCount?: number }> {
+  ): Promise<{
+    modifiedCount: number
+    upsertedCount?: number
+    matchedCount?: number
+    upsertedId?: unknown
+  }> {
     await this._ensureStorageReady()
     await this._executePreHooks('update', { query, update })
 
@@ -1439,14 +1658,19 @@ export class Model<T extends object = Record<string, unknown>> {
         // Handle upsert if no docs were modified
         if (result.modifiedCount === 0 && options?.upsert) {
           const newDoc = this._buildUpsertDocument(query, update)
-          await this.create(newDoc as DeepPartial<T>)
+          const created = await this.create(newDoc as DeepPartial<T>)
           await this._executePostHooks('update', {
             query,
             update,
             modifiedCount: 1,
             upsertedCount: 1
           })
-          return { modifiedCount: 1, upsertedCount: 1 }
+          return {
+            modifiedCount: 1,
+            upsertedCount: 1,
+            matchedCount: 0,
+            upsertedId: (created as Record<string, unknown>)._id
+          }
         }
 
         await this._executePostHooks('update', {
@@ -1454,7 +1678,9 @@ export class Model<T extends object = Record<string, unknown>> {
           update,
           modifiedCount: result.modifiedCount
         })
-        return result
+        // Native strategies report only modifiedCount; a native UPDATE counts
+        // every row the WHERE clause hit, so it doubles as matchedCount
+        return { ...result, matchedCount: result.matchedCount ?? result.modifiedCount }
       } catch (error) {
         // If SQL update fails, fall back to JS (safety net)
         console.warn('Native update failed, falling back to JavaScript:', error)
@@ -1470,7 +1696,7 @@ export class Model<T extends object = Record<string, unknown>> {
       // Handle upsert: create document if it doesn't exist
       if (options?.upsert) {
         const newDoc = this._buildUpsertDocument(query, update)
-        await this.create(newDoc as DeepPartial<T>)
+        const created = await this.create(newDoc as DeepPartial<T>)
 
         await this._executePostHooks('update', {
           query,
@@ -1478,11 +1704,16 @@ export class Model<T extends object = Record<string, unknown>> {
           modifiedCount: 1,
           upsertedCount: 1
         })
-        return { modifiedCount: 1, upsertedCount: 1 }
+        return {
+          modifiedCount: 1,
+          upsertedCount: 1,
+          matchedCount: 0,
+          upsertedId: (created as Record<string, unknown>)._id
+        }
       }
 
       await this._executePostHooks('update', { query, update, modifiedCount: 0 })
-      return { modifiedCount: 0 }
+      return { modifiedCount: 0, matchedCount: 0 }
     }
 
     // Save old state for index update
@@ -1511,11 +1742,11 @@ export class Model<T extends object = Record<string, unknown>> {
       this._updateIndexForDocument(oldState, docToUpdate)
 
       await this._executePostHooks('update', { query, update, modifiedCount: 1, doc: docToUpdate })
-      return { modifiedCount: 1 }
+      return { modifiedCount: 1, matchedCount: 1 }
     }
 
     await this._executePostHooks('update', { query, update, modifiedCount: 0 })
-    return { modifiedCount: 0 }
+    return { modifiedCount: 0, matchedCount: 1 }
   }
 
   updateMany(query: Query<T>, update: Update<T>): QueryBuilder<{ modifiedCount: number }> {
@@ -1546,7 +1777,7 @@ export class Model<T extends object = Record<string, unknown>> {
   private async _executeUpdateMany(
     query: Query<T>,
     update: Update<T>
-  ): Promise<{ modifiedCount: number }> {
+  ): Promise<{ modifiedCount: number; matchedCount?: number }> {
     await this._ensureStorageReady()
     await this._executePreHooks('update', { query, update })
 
@@ -1559,7 +1790,8 @@ export class Model<T extends object = Record<string, unknown>> {
           update,
           modifiedCount: result.modifiedCount
         })
-        return result
+        // Same as _executeUpdateOne: native UPDATE row count doubles as matchedCount
+        return { ...result, matchedCount: result.matchedCount ?? result.modifiedCount }
       } catch (error) {
         console.warn('Native updateMany failed, falling back to JavaScript:', error)
       }
@@ -1570,7 +1802,7 @@ export class Model<T extends object = Record<string, unknown>> {
     const docsToUpdate = await this._findDocumentsUsingIndexes(query)
     if (docsToUpdate.length === 0) {
       await this._executePostHooks('update', { query, update, modifiedCount: 0 })
-      return { modifiedCount: 0 }
+      return { modifiedCount: 0, matchedCount: 0 }
     }
 
     // Validate all updates first (atomic - fail fast)
@@ -1600,7 +1832,7 @@ export class Model<T extends object = Record<string, unknown>> {
     }
 
     await this._executePostHooks('update', { query, update, modifiedCount, docs: docsToUpdate })
-    return { modifiedCount }
+    return { modifiedCount, matchedCount: docsToUpdate.length }
   }
 
   // --- Count Operations ---

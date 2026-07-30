@@ -41,6 +41,9 @@ import { FindQueryBuilder as _FindQueryBuilder } from './src/find-query-builder'
 export const QueryBuilder = _QueryBuilder
 export const DocumentQueryBuilder = _DocumentQueryBuilder
 export const FindQueryBuilder = _FindQueryBuilder
+export { QueryCursor } from './src/find-query-builder'
+export { BulkWriteError } from './src/model'
+export type { BulkWriteOperation, BulkWriteResult } from './src/model'
 
 // ObjectId
 import { ObjectId as _ObjectId } from './src/objectid'
