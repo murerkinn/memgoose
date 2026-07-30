@@ -512,10 +512,25 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
         return null
       }
 
+      if ('$literal' in expr) {
+        return (expr as { $literal: unknown }).$literal
+      }
+
       if ('$ifNull' in expr) {
-        const [field, defaultValue] = expr.$ifNull
-        const value = this.resolveFieldPath(doc, field)
-        return value !== null && value !== undefined ? value : defaultValue
+        // MongoDB 4.4+ n-ary form: return the first operand that evaluates to a
+        // non-null value; the last operand is the replacement and its evaluated
+        // value is returned even when null. Operands are full expressions.
+        const operands = expr.$ifNull as unknown[]
+        if (!Array.isArray(operands) || operands.length < 2) {
+          throw new Error(
+            `memgoose: $ifNull takes at least 2 arguments, got ${Array.isArray(operands) ? operands.length : typeof operands}`
+          )
+        }
+        for (let i = 0; i < operands.length - 1; i++) {
+          const value = this.evaluateExpression(operands[i] as ProjectionExpression, doc)
+          if (value !== null && value !== undefined) return value
+        }
+        return this.evaluateExpression(operands[operands.length - 1] as ProjectionExpression, doc)
       }
 
       if ('$arrayElemAt' in expr) {

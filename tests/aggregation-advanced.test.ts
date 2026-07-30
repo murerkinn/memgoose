@@ -132,6 +132,111 @@ describe('Advanced Aggregation Operations', async () => {
     assert.strictEqual(results[1].desc, 'No description')
   })
 
+  it('should evaluate expression operands of $ifNull', async () => {
+    const Product = db.model(
+      'ProductIfNullExpr',
+      new Schema({ name: String, alias: String, iso2: String, country: String })
+    )
+
+    await Product.insertMany([
+      { name: 'A', alias: 'a-alias', iso2: 'GB', country: 'United Kingdom' },
+      { name: 'B', country: 'India' },
+      { name: 'C' }
+    ])
+
+    const results = await Product.aggregate([
+      {
+        $project: {
+          name: 1,
+          // field-path fallback must resolve, not return the literal '$name'
+          label: { $ifNull: ['$alias', '$name'] },
+          // operator-expression fallback must be evaluated, incl. nested $ifNull
+          code: { $ifNull: ['$iso2', { $ifNull: ['$country', '?'] }] }
+        }
+      },
+      { $sort: { name: 1 } }
+    ])
+
+    assert.deepStrictEqual(
+      results.map(r => [r.label, r.code]),
+      [
+        ['a-alias', 'GB'],
+        ['B', 'India'],
+        ['C', '?']
+      ]
+    )
+  })
+
+  it('should support more than two $ifNull operands', async () => {
+    const Product = db.model(
+      'ProductIfNullNary',
+      new Schema({ n: Number, a: String, b: String, c: String })
+    )
+
+    await Product.insertMany([
+      { n: 1, a: 'first' },
+      { n: 2, b: 'second' },
+      { n: 3, c: 'third' },
+      { n: 4 }
+    ])
+
+    const results = await Product.aggregate([
+      { $project: { n: 1, picked: { $ifNull: ['$a', '$b', '$c', 'fallback'] } } },
+      { $sort: { n: 1 } }
+    ])
+
+    assert.deepStrictEqual(
+      results.map(r => r.picked),
+      ['first', 'second', 'third', 'fallback']
+    )
+  })
+
+  it('should omit the field when the replacement evaluates to missing', async () => {
+    const Product = db.model('ProductIfNullMissing', new Schema({ a: String, b: String }))
+
+    await Product.insertMany([{}])
+
+    const results = await Product.aggregate([{ $project: { picked: { $ifNull: ['$a', '$b'] } } }])
+
+    assert.ok(!('picked' in results[0]))
+  })
+
+  it('should keep the field when the replacement is a literal null', async () => {
+    const Product = db.model('ProductIfNullLiteralNull', new Schema({ a: String }))
+
+    await Product.insertMany([{}])
+
+    const results = await Product.aggregate([{ $project: { picked: { $ifNull: ['$a', null] } } }])
+
+    assert.ok('picked' in results[0])
+    assert.strictEqual(results[0].picked, null)
+  })
+
+  it('should return a dollar-prefixed literal fallback via $literal', async () => {
+    const Product = db.model('ProductIfNullLiteral', new Schema({ price: Number }))
+
+    await Product.insertMany([{}])
+
+    const results = await Product.aggregate([
+      { $project: { price: { $ifNull: ['$price', { $literal: '$TBD' }] } } }
+    ])
+
+    assert.strictEqual(results[0].price, '$TBD')
+  })
+
+  it('should reject $ifNull with fewer than two operands', async () => {
+    const Product = db.model('ProductIfNullArity', new Schema({ a: String }))
+
+    await Product.insertMany([{ a: 'x' }])
+
+    await assert.rejects(
+      async () => {
+        await Product.aggregate([{ $project: { picked: { $ifNull: ['$a'] } } }])
+      },
+      { message: /takes at least 2 arguments/ }
+    )
+  })
+
   it('should handle $arrayElemAt operator', async () => {
     const Product = db.model(
       'ProductArrayElem',

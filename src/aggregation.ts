@@ -76,11 +76,12 @@ export type ProjectionExpression =
   | { $toLower: string }
   | { $substr: [string, number, number] }
   | { $cond: [unknown, unknown, unknown] }
+  | { $literal: unknown }
   | { $add: (number | string)[] }
   | { $subtract: [number | string, number | string] }
   | { $multiply: (number | string)[] }
   | { $divide: [number | string, number | string] }
-  | { $ifNull: [string, unknown] }
+  | { $ifNull: (string | ProjectionExpression | unknown)[] }
   | { $arrayElemAt: [string | ProjectionExpression, number] }
   | { $size: string | ProjectionExpression }
   // Date extraction operators
