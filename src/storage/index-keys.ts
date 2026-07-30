@@ -23,7 +23,9 @@ export function resolveDocumentPath(source: unknown, path: string): unknown {
     if (current === null || current === undefined) return undefined
     if (Array.isArray(current)) {
       const projected = current
-        .map(el => (el && typeof el === 'object' ? (el as Record<string, unknown>)[segment] : undefined))
+        .map(el =>
+          el && typeof el === 'object' ? (el as Record<string, unknown>)[segment] : undefined
+        )
         .filter(v => v !== undefined)
       current = projected.length > 0 ? projected.flat() : undefined
       continue
@@ -39,10 +41,41 @@ export function computeIndexKeys(
   fields: ReadonlyArray<string | number | symbol>,
   options?: { skipNullish?: boolean }
 ): string[] {
-  let keyParts: string[][] = [[]]
-  for (const field of fields) {
-    const value = resolveDocumentPath(source, String(field))
+  // Degenerate zero-field index: keep the historical '' key so write-side and
+  // read-side lookups keep agreeing.
+  if (fields.length === 0) return ['']
+
+  // Scalar-only documents are the overwhelmingly common case and sit on the
+  // write hot path (every insert and update touches every index), so they get
+  // a plain string-concat key with no expansion machinery. Only an array
+  // value makes the index multikey and takes the cartesian branch below.
+  if (fields.length === 1) {
+    const value = resolveDocumentPath(source, String(fields[0]))
     if (options?.skipNullish && (value === undefined || value === null)) return []
+    if (!Array.isArray(value)) return [String(value)]
+    return expandMultikey([value])
+  }
+
+  const resolved: unknown[] = new Array(fields.length)
+  let hasArray = false
+  for (let i = 0; i < fields.length; i++) {
+    const value = resolveDocumentPath(source, String(fields[i]))
+    if (options?.skipNullish && (value === undefined || value === null)) return []
+    if (Array.isArray(value)) hasArray = true
+    resolved[i] = value
+  }
+  if (!hasArray) {
+    let key = String(resolved[0])
+    for (let i = 1; i < resolved.length; i++) key += ':' + String(resolved[i])
+    return [key]
+  }
+  return expandMultikey(resolved)
+}
+
+/** Cartesian expansion for multikey indexes, deduped per bucket. */
+function expandMultikey(resolved: unknown[]): string[] {
+  let keyParts: string[][] = [[]]
+  for (const value of resolved) {
     const variants =
       Array.isArray(value) && value.length > 0 ? value.map(v => String(v)) : [String(value)]
     keyParts = keyParts.flatMap(parts => variants.map(v => [...parts, v]))
