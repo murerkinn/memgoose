@@ -35,8 +35,8 @@ export type DeepPartial<T> = T extends object
 export type QueryOperator<T = unknown> = {
   $eq?: T
   $ne?: T
-  $in?: T[]
-  $nin?: T[]
+  $in?: Array<T | RegExp>
+  $nin?: Array<T | RegExp>
   $gt?: T
   $gte?: T
   $lt?: T
@@ -712,6 +712,37 @@ export class Model<T extends object = Record<string, unknown>> {
   }
 
   // --- Query Matching ---
+  /**
+   * Whether a single value matches any member of an $in/$nin array: regex
+   * members are matched as regex tests against string values (or as equality
+   * against stored regex values), everything else keeps equality semantics.
+   */
+  private _matchesInMember(value: unknown, members: unknown[]): boolean {
+    return members.some(member => {
+      if (member instanceof RegExp) {
+        if (value instanceof RegExp) {
+          return member.source === value.source && member.flags === value.flags
+        }
+        if (typeof value !== 'string') return false
+        // shared g/y regexes carry lastIndex state across tests — reset it
+        member.lastIndex = 0
+        return member.test(value)
+      }
+      // NaN clause on top: _compareValues is strict there, $in uses SameValueZero
+      return (member !== member && value !== value) || this._compareValues(value, member)
+    })
+  }
+
+  /** Full $in semantics for a field value (null members match missing fields). */
+  private _matchesIn(field: unknown, v: unknown): boolean {
+    if (!Array.isArray(v)) return false
+    if (v.includes(null) && (field === null || field === undefined)) return true
+    if (Array.isArray(field)) {
+      return field.some(item => this._matchesInMember(item, v))
+    }
+    return this._matchesInMember(field, v)
+  }
+
   // Helper for ObjectId comparison (defined once, not per document)
   private _compareValues(a: unknown, b: unknown): boolean {
     // Fast path for primitives (most common case)
@@ -778,6 +809,14 @@ export class Model<T extends object = Record<string, unknown>> {
         return this._compareValues(field, value)
       }
 
+      // Bare regex equality: { field: /re/ } behaves like a single-member $in
+      if (value instanceof RegExp) {
+        if (Array.isArray(field)) {
+          return field.some(item => this._matchesInMember(item, [value]))
+        }
+        return this._matchesInMember(field, [value])
+      }
+
       // Skip operator checking for arrays
       if (Array.isArray(value)) {
         return this._compareValues(field, value)
@@ -806,25 +845,10 @@ export class Model<T extends object = Record<string, unknown>> {
               // Array fields: $ne excludes documents whose array contains the value
               return !this._compareValues(field, v)
             case '$in':
-              // MongoDB behavior: $in: [null] matches both null and undefined
-              if (Array.isArray(v) && v.includes(null) && (field === null || field === undefined)) {
-                return true
-              }
-              if (!Array.isArray(v)) return false
-              if (Array.isArray(field)) {
-                return field.some(item => v.includes(item))
-              }
-              return v.includes(field)
+              return this._matchesIn(field, v)
             case '$nin':
-              // MongoDB behavior: $nin: [null] excludes both null and undefined
-              if (Array.isArray(v) && v.includes(null) && (field === null || field === undefined)) {
-                return false
-              }
               if (!Array.isArray(v)) return false
-              if (Array.isArray(field)) {
-                return field.every(item => !v.includes(item))
-              }
-              return !v.includes(field)
+              return !this._matchesIn(field, v)
             case '$gt':
               return (field as unknown as number | Date) > (v as unknown as number | Date)
             case '$gte':
@@ -849,9 +873,9 @@ export class Model<T extends object = Record<string, unknown>> {
                     case '$ne':
                       return field !== notV
                     case '$in':
-                      return Array.isArray(notV) && notV.includes(field)
+                      return this._matchesIn(field, notV)
                     case '$nin':
-                      return Array.isArray(notV) && !notV.includes(field)
+                      return Array.isArray(notV) && !this._matchesIn(field, notV)
                     case '$gt':
                       return (
                         (field as unknown as number | Date) > (notV as unknown as number | Date)
@@ -926,7 +950,10 @@ export class Model<T extends object = Record<string, unknown>> {
               })
             case '$all':
               if (!Array.isArray(field) || !Array.isArray(v)) return false
-              return (v as unknown[]).every(item => field.includes(item))
+              // each member (regex or plain) must match at least one element
+              return (v as unknown[]).every(member =>
+                field.some(item => this._matchesInMember(item, [member]))
+              )
             default:
               return false
           }

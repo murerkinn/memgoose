@@ -171,6 +171,30 @@ export class SqliteStorageStrategy<T extends object> implements StorageStrategy<
         return 0
       }
     })
+
+    // Regex test for $in/$nin/$all members and bare-regex equality: matches a
+    // string value, or any string element when the value is a JSON array
+    this._db.function(
+      'regexp_any',
+      (text: string | number | null, pattern: string, flags: string) => {
+        if (typeof text !== 'string') return 0
+        let re: RegExp
+        try {
+          re = new RegExp(pattern, flags)
+        } catch {
+          return 0
+        }
+        try {
+          const parsed = JSON.parse(text)
+          if (Array.isArray(parsed)) {
+            return parsed.some(el => typeof el === 'string' && re.test(el)) ? 1 : 0
+          }
+        } catch {
+          // not JSON — treat as a plain string
+        }
+        return re.test(text) ? 1 : 0
+      }
+    )
   }
 
   // ============================================================================

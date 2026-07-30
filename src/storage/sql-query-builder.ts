@@ -156,6 +156,12 @@ export class SqlQueryBuilder<T extends object> {
       return { sql: `json_extract(data, '$.${field}') IS NULL`, params: [] }
     }
 
+    // Bare regex equality: { field: /re/ } behaves like a single-member $in
+    if (value instanceof RegExp) {
+      params.push(value.source, value.flags)
+      return { sql: `regexp_any(json_extract(data, '$.${field}'), ?, ?)`, params }
+    }
+
     if (typeof value !== 'object' || value instanceof ObjectId || value instanceof Date) {
       const serialized = this.serializeValue(value)
       params.push(serialized)
@@ -244,22 +250,23 @@ export class SqlQueryBuilder<T extends object> {
         }
         // MongoDB behavior: $in: [null] matches both null and undefined (missing fields)
         const hasNull = value.some(v => v === null || v === undefined)
-        const nonNullValues = value.filter(v => v !== null && v !== undefined)
+        const regexMembers = value.filter((v): v is RegExp => v instanceof RegExp)
+        const nonNullValues = value.filter(
+          v => v !== null && v !== undefined && !(v instanceof RegExp)
+        )
 
-        if (hasNull && nonNullValues.length === 0) {
-          // Only null in array
-          return { sql: `${fieldExpr} IS NULL`, params: [] }
-        } else if (hasNull) {
-          // Mix of null and other values
+        const branches: string[] = []
+        if (hasNull) branches.push(`${fieldExpr} IS NULL`)
+        if (nonNullValues.length > 0) {
           const placeholders = nonNullValues.map(() => '?').join(', ')
           params.push(...nonNullValues.map(v => this.serializeValue(v)))
-          return { sql: `(${fieldExpr} IS NULL OR ${fieldExpr} IN (${placeholders}))`, params }
-        } else {
-          // No null values
-          const placeholders = value.map(() => '?').join(', ')
-          params.push(...value.map(v => this.serializeValue(v)))
-          return { sql: `${fieldExpr} IN (${placeholders})`, params }
+          branches.push(`${fieldExpr} IN (${placeholders})`)
         }
+        for (const re of regexMembers) {
+          params.push(re.source, re.flags)
+          branches.push(`regexp_any(${fieldExpr}, ?, ?)`)
+        }
+        return { sql: `(${branches.join(' OR ')})`, params }
       }
 
       case '$nin': {
@@ -268,25 +275,30 @@ export class SqlQueryBuilder<T extends object> {
         }
         // MongoDB behavior: $nin: [null] excludes both null and undefined (missing fields)
         const hasNull = value.some(v => v === null || v === undefined)
-        const nonNullValues = value.filter(v => v !== null && v !== undefined)
+        const regexMembers = value.filter((v): v is RegExp => v instanceof RegExp)
+        const nonNullValues = value.filter(
+          v => v !== null && v !== undefined && !(v instanceof RegExp)
+        )
 
-        if (hasNull && nonNullValues.length === 0) {
-          // Only null in array - exclude null/undefined
-          return { sql: `${fieldExpr} IS NOT NULL`, params: [] }
-        } else if (hasNull) {
-          // Mix of null and other values - must be NOT NULL AND NOT IN (...)
+        const clauses: string[] = []
+        if (hasNull) {
+          clauses.push(`${fieldExpr} IS NOT NULL`)
+        }
+        if (nonNullValues.length > 0) {
           const placeholders = nonNullValues.map(() => '?').join(', ')
           params.push(...nonNullValues.map(v => this.serializeValue(v)))
-          return {
-            sql: `(${fieldExpr} IS NOT NULL AND ${fieldExpr} NOT IN (${placeholders}))`,
-            params
-          }
-        } else {
-          // No null values - original behavior
-          const placeholders = value.map(() => '?').join(', ')
-          params.push(...value.map(v => this.serializeValue(v)))
-          return { sql: `(${fieldExpr} NOT IN (${placeholders}) OR ${fieldExpr} IS NULL)`, params }
+          clauses.push(
+            hasNull
+              ? `${fieldExpr} NOT IN (${placeholders})`
+              : `(${fieldExpr} NOT IN (${placeholders}) OR ${fieldExpr} IS NULL)`
+          )
         }
+        for (const re of regexMembers) {
+          // NULL values make regexp_any return 0, keeping missing fields matched
+          params.push(re.source, re.flags)
+          clauses.push(`NOT regexp_any(${fieldExpr}, ?, ?)`)
+        }
+        return { sql: `(${clauses.join(' AND ')})`, params }
       }
 
       case '$regex': {
@@ -312,8 +324,12 @@ export class SqlQueryBuilder<T extends object> {
         if (!Array.isArray(value)) {
           return { sql: '0', params: [] }
         }
-        // Each element must be in the array
+        // Each member must match at least one element (regex members as tests)
         const conditions = value.map(val => {
+          if (val instanceof RegExp) {
+            params.push(val.source, val.flags)
+            return `regexp_any(${fieldExpr}, ?, ?)`
+          }
           const serialized = JSON.stringify(val)
           params.push(serialized)
           return `json_array_contains(${fieldExpr}, ?)`
