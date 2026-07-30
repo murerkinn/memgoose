@@ -1360,17 +1360,22 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
       if (Array.isArray(array) && array.length > 0) {
         // Unwind array
         array.forEach((item, index) => {
-          const unwound = { ...doc, [fieldPath]: item }
+          let unwound = this.cloneWithValueAtPath(doc, fieldPath, item)
           if (includeArrayIndex) {
-            unwound[includeArrayIndex] = index
+            unwound = this.cloneWithValueAtPath(unwound, includeArrayIndex, index)
           }
           result.push(unwound)
         })
       } else if (preserveNullAndEmptyArrays) {
-        // Keep document with null/empty array
-        const unwound = { ...doc, [fieldPath]: null }
+        // Keep the document. Null is written at the path only when its parent
+        // chain exists as plain documents; when a parent is missing or not a
+        // document, MongoDB leaves the document untouched, so fabricating the
+        // chain here would corrupt it.
+        let unwound = this.canWriteAtPath(doc, fieldPath)
+          ? this.cloneWithValueAtPath(doc, fieldPath, null)
+          : { ...doc }
         if (includeArrayIndex) {
-          unwound[includeArrayIndex] = null
+          unwound = this.cloneWithValueAtPath(unwound, includeArrayIndex, null)
         }
         result.push(unwound)
       }
@@ -1378,6 +1383,53 @@ export class AggregationEngine<T extends object = Record<string, unknown>> {
     }
 
     return result
+  }
+
+  /** Whether every parent segment of a dotted path exists as a plain document. */
+  private canWriteAtPath(doc: AggregationResult, path: string): boolean {
+    const segments = path.split('.')
+    let current: unknown = doc
+    for (let i = 0; i < segments.length - 1; i++) {
+      current = (current as Record<string, unknown>)[segments[i]]
+      if (!current || typeof current !== 'object' || Array.isArray(current)) return false
+    }
+    return true
+  }
+
+  /**
+   * Shallow-clone a document and place a value at a (possibly dotted) path,
+   * cloning each object along the path so sibling copies produced by $unwind
+   * never share the containers being rewritten. Isolation covers the rewritten
+   * path only — untouched subtrees still alias the source document.
+   */
+  private cloneWithValueAtPath(
+    doc: AggregationResult,
+    path: string,
+    value: unknown
+  ): AggregationResult {
+    const setOwn = (obj: Record<string, unknown>, key: string, val: unknown) => {
+      // defineProperty writes an own property even for keys like __proto__
+      Object.defineProperty(obj, key, {
+        value: val,
+        writable: true,
+        enumerable: true,
+        configurable: true
+      })
+    }
+    const segments = path.split('.')
+    const root = { ...doc }
+    let target: Record<string, unknown> = root
+    for (let i = 0; i < segments.length - 1; i++) {
+      const existing = target[segments[i]]
+      const cloned =
+        existing && typeof existing === 'object' && !Array.isArray(existing)
+          ? { ...(existing as Record<string, unknown>) }
+          : {}
+      setOwn(target, segments[i], cloned)
+      target = cloned
+    }
+    setOwn(target, segments[segments.length - 1], value)
+    return root
   }
 
   private sort(data: AggregationResult[], sortStage: SortStage): AggregationResult[] {

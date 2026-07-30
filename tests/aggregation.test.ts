@@ -541,6 +541,128 @@ describe('Aggregation Pipeline', () => {
       assert.strictEqual(results[1].itemIndex, 1)
       assert.strictEqual(results[2].itemIndex, 2)
     })
+
+    it('should unwind a nested array path into the nested structure', async () => {
+      const Profile = model(
+        'UnwindNested',
+        new Schema({ employeeId: Number, raw: Schema.Types.Mixed })
+      )
+      await Profile.insertMany([
+        {
+          employeeId: 1,
+          raw: {
+            country: 'IN',
+            education: [{ school: 'IIT Delhi' }, { school: 'IIM Ahmedabad' }]
+          }
+        },
+        { employeeId: 2, raw: { country: 'US', education: [{ school: 'MIT' }] } }
+      ])
+
+      const results = await Profile.aggregate([
+        { $unwind: '$raw.education' },
+        { $match: { 'raw.education.school': { $ne: null } } },
+        { $group: { _id: '$raw.education.school', count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }
+      ])
+
+      assert.deepStrictEqual(results, [
+        { _id: 'IIM Ahmedabad', count: 1 },
+        { _id: 'IIT Delhi', count: 1 },
+        { _id: 'MIT', count: 1 }
+      ])
+    })
+
+    it('should not leak the unwound element across sibling copies', async () => {
+      const Profile = model(
+        'UnwindNestedIsolation',
+        new Schema({ employeeId: Number, raw: Schema.Types.Mixed })
+      )
+      await Profile.create({
+        employeeId: 1,
+        raw: { country: 'IN', education: [{ school: 'A' }, { school: 'B' }] }
+      })
+
+      const results = await Profile.aggregate([{ $unwind: '$raw.education' }])
+
+      assert.strictEqual(results.length, 2)
+      assert.deepStrictEqual(results[0].raw.education, { school: 'A' })
+      assert.deepStrictEqual(results[1].raw.education, { school: 'B' })
+      // sibling copies share the rest of the parent object untouched
+      assert.strictEqual(results[0].raw.country, 'IN')
+      assert.strictEqual(results[1].raw.country, 'IN')
+    })
+
+    it('should write the nested null and index for preserveNullAndEmptyArrays', async () => {
+      const Profile = model(
+        'UnwindNestedPreserve',
+        new Schema({ employeeId: Number, raw: Schema.Types.Mixed })
+      )
+      await Profile.insertMany([
+        { employeeId: 1, raw: { education: [{ school: 'A' }] } },
+        { employeeId: 2, raw: { education: [] } }
+      ])
+
+      const results = await Profile.aggregate([
+        {
+          $unwind: {
+            path: '$raw.education',
+            preserveNullAndEmptyArrays: true,
+            includeArrayIndex: 'eduIndex'
+          }
+        },
+        { $sort: { employeeId: 1 } }
+      ])
+
+      assert.strictEqual(results.length, 2)
+      assert.deepStrictEqual(results[0].raw.education, { school: 'A' })
+      assert.strictEqual(results[0].eduIndex, 0)
+      assert.strictEqual(results[1].raw.education, null)
+      assert.strictEqual(results[1].eduIndex, null)
+    })
+
+    it('should nest a dotted includeArrayIndex path', async () => {
+      const Profile = model(
+        'UnwindDottedIndex',
+        new Schema({ employeeId: Number, raw: Schema.Types.Mixed })
+      )
+      await Profile.insertMany([
+        { employeeId: 1, raw: { education: [{ school: 'A' }, { school: 'B' }] } }
+      ])
+
+      const results = await Profile.aggregate([
+        { $unwind: { path: '$raw.education', includeArrayIndex: 'raw.eduIdx' } },
+        { $match: { 'raw.eduIdx': 0 } }
+      ])
+
+      assert.strictEqual(results.length, 1)
+      assert.deepStrictEqual(results[0].raw.education, { school: 'A' })
+      assert.strictEqual(results[0].raw.eduIdx, 0)
+    })
+
+    it('should not fabricate missing parents when preserving', async () => {
+      const Profile = model(
+        'UnwindPreserveNoParent',
+        new Schema({ employeeId: Number, raw: Schema.Types.Mixed })
+      )
+      await Profile.insertMany([
+        { employeeId: 1 },
+        { employeeId: 2, raw: 'legacy-string' },
+        { employeeId: 3, raw: { education: [] } }
+      ])
+
+      const results = await Profile.aggregate([
+        { $unwind: { path: '$raw.education', preserveNullAndEmptyArrays: true } },
+        { $sort: { employeeId: 1 } }
+      ])
+
+      assert.strictEqual(results.length, 3)
+      // no raw at all → document passes through untouched
+      assert.ok(!('raw' in results[0]))
+      // scalar parent → untouched, not clobbered into an object
+      assert.strictEqual(results[1].raw, 'legacy-string')
+      // existing parent chain → null written at the path
+      assert.strictEqual(results[2].raw.education, null)
+    })
   })
 
   describe('$lookup stage', () => {
