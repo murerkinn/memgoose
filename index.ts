@@ -1,5 +1,11 @@
 // Schema and related exports
-import { Schema as _Schema, VirtualType, ValidationError, DuplicateKeyError } from './src/schema'
+import {
+  Schema as _Schema,
+  Mixed as _Mixed,
+  VirtualType,
+  ValidationError,
+  DuplicateKeyError
+} from './src/schema'
 export { VirtualType, ValidationError, DuplicateKeyError }
 export const Schema = _Schema
 export type {
@@ -52,7 +58,8 @@ export { ObjectId } from './src/objectid'
 
 // Types namespace (Mongoose-compatible)
 export const Types = {
-  ObjectId: _ObjectId
+  ObjectId: _ObjectId,
+  Mixed: _Mixed
 }
 
 // Aggregation pipeline
@@ -118,7 +125,8 @@ const memgoose = {
   Document: _Document,
   ObjectId: _ObjectId,
   Types: {
-    ObjectId: _ObjectId
+    ObjectId: _ObjectId,
+    Mixed: _Mixed
   },
 
   // Query builders

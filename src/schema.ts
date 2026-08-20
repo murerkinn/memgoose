@@ -156,11 +156,15 @@ export type SchemaOptions = {
   autoSearchIndex?: boolean
 }
 
+// Marker for a field with no declared shape (mongoose's Schema.Types.Mixed)
+export class Mixed {}
+
 // Schema definition (simplified - just for type info and indexes)
 export class Schema<T extends object = Record<string, unknown>> {
   // Static Types property for mongoose compatibility (e.g., Schema.Types.ObjectId)
   static Types = {
-    ObjectId: ObjectId
+    ObjectId: ObjectId,
+    Mixed: Mixed
   }
 
   private _definition: Record<string, unknown>
