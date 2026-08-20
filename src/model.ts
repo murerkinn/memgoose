@@ -128,6 +128,24 @@ export type PopulateOptions = {
   model?: string
 }
 
+// Update operators the SQL builder can translate faithfully. inc and dec are
+// excluded: they interpolate the expression built so far twice, duplicating its
+// placeholders without their values, so the statement fails as soon as anything
+// else in the update binds a parameter
+const NATIVE_UPDATE_OPERATORS = new Set(['$set', '$unset'])
+
+// Field options that let the schema reject a document
+const VALIDATING_FIELD_OPTIONS = [
+  'required',
+  'min',
+  'max',
+  'minLength',
+  'maxLength',
+  'enum',
+  'match',
+  'validate'
+] as const
+
 export class Model<T extends object = Record<string, unknown>> {
   private _storage: StorageStrategy<T>
   private _schema?: Schema<T>
@@ -484,6 +502,48 @@ export class Model<T extends object = Record<string, unknown>> {
     if (timestampConfig.updatedAt) {
       docWithTimestamps[timestampConfig.updatedAt] = now
     }
+  }
+
+  /**
+   * _applyTimestamps for the native update path, which never materialises a
+   * document to stamp. Applied last, like _applyTimestamps runs after
+   * _applyUpdate, so it wins over an explicit updatedAt in the caller's update.
+   */
+  private _applyTimestampsToUpdate(update: Update<T>): Update<T> {
+    const timestampConfig = this._schema?.getTimestampConfig()
+    if (!timestampConfig?.updatedAt) return update
+
+    const updateRecord = update as Record<string, unknown>
+    // An empty update modifies nothing on the JavaScript path either
+    if (Object.keys(updateRecord).length === 0) return update
+
+    const now = new Date()
+    const hasOperators = Object.keys(updateRecord).some(k => k.startsWith('$'))
+    if (!hasOperators) {
+      return { ...updateRecord, [timestampConfig.updatedAt]: now } as Update<T>
+    }
+
+    // The builder applies unset after set, so a caller unsetting updatedAt would
+    // otherwise remove the stamp again — drop the field from every other operator
+    const stamped: Record<string, unknown> = {}
+    for (const [operator, payload] of Object.entries(updateRecord)) {
+      if (operator === '$set' || typeof payload !== 'object' || payload === null) {
+        stamped[operator] = payload
+        continue
+      }
+      const kept = Object.fromEntries(
+        Object.entries(payload as Record<string, unknown>).filter(
+          ([field]) => field !== timestampConfig.updatedAt
+        )
+      )
+      if (Object.keys(kept).length > 0) stamped[operator] = kept
+    }
+
+    const existingSet = (updateRecord.$set ?? {}) as Record<string, unknown>
+    return {
+      ...stamped,
+      $set: { ...existingSet, [timestampConfig.updatedAt]: now }
+    } as Update<T>
   }
 
   private _checkUniqueConstraints(doc: Partial<T>, excludeDoc?: T): void {
@@ -1485,6 +1545,43 @@ export class Model<T extends object = Record<string, unknown>> {
   }
 
   // --- Update Operations ---
+  /**
+   * Whether the native SQL update can express this update faithfully. The builder
+   * silently drops what it cannot translate, leaving an UPDATE that rewrites
+   * `data` to itself and still reports matched rows.
+   */
+  private _nativeUpdateSupported(update: Update<T>): boolean {
+    const entries = Object.entries(update as Record<string, unknown>)
+    const hasOperators = entries.some(([key]) => key.startsWith('$'))
+
+    if (!hasOperators) return entries.every(([field]) => !field.includes('.'))
+
+    return entries.every(([operator, payload]) => {
+      if (!NATIVE_UPDATE_OPERATORS.has(operator)) return false
+      if (typeof payload !== 'object' || payload === null) return false
+      return Object.keys(payload).every(field => !field.includes('.'))
+    })
+  }
+
+  /**
+   * Whether the schema can reject a document. The native update never
+   * materialises one, so it can only stand in for the JavaScript path — which
+   * validates every affected document before writing any of them — when there is
+   * nothing to enforce.
+   */
+  private _schemaCanRejectDocument(): boolean {
+    if (!this._schema) return false
+    if (this._schema.getUniqueIndexes().size > 0) return true
+
+    for (const options of this._schema.getAllFieldOptions().values()) {
+      // A subdocument schema carries its own constraints
+      if (options.type instanceof Schema) return true
+      if (VALIDATING_FIELD_OPTIONS.some(key => options[key] !== undefined)) return true
+    }
+
+    return false
+  }
+
   private _applyUpdate(doc: T, update: Update<T>, opts?: { isInsert?: boolean }): boolean {
     let modified = false
 
@@ -1677,47 +1774,10 @@ export class Model<T extends object = Record<string, unknown>> {
     await this._ensureStorageReady()
     await this._executePreHooks('update', { query, update })
 
-    // NEW: Use native update if available
-    if (typeof (this._storage as any).updateNative === 'function') {
-      try {
-        const result = await (this._storage as any).updateNative(query, update)
-
-        // Handle upsert if no docs were modified
-        if (result.modifiedCount === 0 && options?.upsert) {
-          const newDoc = this._buildUpsertDocument(query, update)
-          const created = await this.create(newDoc as DeepPartial<T>)
-          await this._executePostHooks('update', {
-            query,
-            update,
-            modifiedCount: 1,
-            upsertedCount: 1
-          })
-          return {
-            modifiedCount: 1,
-            upsertedCount: 1,
-            matchedCount: 0,
-            upsertedId: (created as Record<string, unknown>)._id
-          }
-        }
-
-        await this._executePostHooks('update', {
-          query,
-          update,
-          modifiedCount: result.modifiedCount
-        })
-        // Native strategies report only modifiedCount; a native UPDATE counts
-        // every row the WHERE clause hit, so it doubles as matchedCount
-        return { ...result, matchedCount: result.matchedCount ?? result.modifiedCount }
-      } catch (error) {
-        // If SQL update fails, fall back to JS (safety net)
-        console.warn('Native update failed, falling back to JavaScript:', error)
-      }
-    }
-
-    // EXISTING: JavaScript-based update logic
-    // Use indexes for efficient lookup
-    const candidates = await this._findDocumentsUsingIndexes(query)
-    let docToUpdate = candidates[0]
+    // No native update path: a bare WHERE has no LIMIT and would rewrite every
+    // match, skipping validation, unique constraints and timestamps with it
+    const candidates = await this._findDocumentsUsingIndexes(query, { limit: 1 })
+    const docToUpdate = candidates[0]
 
     if (!docToUpdate) {
       // Handle upsert: create document if it doesn't exist
@@ -1808,16 +1868,25 @@ export class Model<T extends object = Record<string, unknown>> {
     await this._ensureStorageReady()
     await this._executePreHooks('update', { query, update })
 
-    // NEW: Use native update if available
-    if (typeof (this._storage as any).updateNative === 'function') {
+    // NEW: Use native update when the SQL builder can express it faithfully and
+    // the schema has no constraint the native path would write straight past
+    if (
+      typeof (this._storage as any).updateNative === 'function' &&
+      this._nativeUpdateSupported(update) &&
+      !this._schemaCanRejectDocument()
+    ) {
       try {
-        const result = await (this._storage as any).updateNative(query, update)
+        const result = await (this._storage as any).updateNative(
+          query,
+          this._applyTimestampsToUpdate(update)
+        )
         await this._executePostHooks('update', {
           query,
           update,
           modifiedCount: result.modifiedCount
         })
-        // Same as _executeUpdateOne: native UPDATE row count doubles as matchedCount
+        // A native UPDATE counts every row the WHERE clause hit, so it doubles
+        // as matchedCount
         return { ...result, matchedCount: result.matchedCount ?? result.modifiedCount }
       } catch (error) {
         console.warn('Native updateMany failed, falling back to JavaScript:', error)
