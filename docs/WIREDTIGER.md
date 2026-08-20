@@ -22,6 +22,8 @@ The `memgoose-wiredtiger` package includes native bindings that require build to
 
 - **Node.js**: 16+ with N-API support
 - **C++ compiler**: gcc, clang, or MSVC
+- **CMake**: 3.x — the package compiles the bundled WiredTiger library before
+  building the bindings, and its install script fails without it
 - **Python**: 3.x (for node-gyp)
 - **Build tools**:
   - **macOS**: Xcode Command Line Tools (`xcode-select --install`)
@@ -157,20 +159,27 @@ Make sure you have the required build tools installed:
 ```bash
 # macOS
 xcode-select --install
+brew install cmake
 
 # Linux (Debian/Ubuntu)
-sudo apt-get install build-essential autoconf libtool
+sudo apt-get install build-essential autoconf libtool cmake
 
 # Then retry installation
 npm install memgoose-wiredtiger
 ```
+
+A missing CMake is the most common cause: the install script builds the bundled
+WiredTiger library first, so without it the bindings are never compiled and the
+package installs without them.
 
 ### Runtime error: "WiredTiger native bindings not available"
 
 The `memgoose-wiredtiger` package is not installed or wasn't built successfully. Options:
 
 1. Install the package: `npm install memgoose-wiredtiger`
-2. Use a different storage backend: `storage: 'sqlite'` or `storage: 'file'`
+2. Rebuild the bindings after installing the prerequisites above:
+   `npm rebuild memgoose-wiredtiger`
+3. Use a different storage backend: `storage: 'sqlite'` or `storage: 'file'`
 
 ### Database won't open: "Resource busy"
 
