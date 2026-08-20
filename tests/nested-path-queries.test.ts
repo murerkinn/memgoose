@@ -11,7 +11,7 @@ test('Nested dotted-path queries', async t => {
   await t.test('equality on a nested subdocument field', async () => {
     const M = model(
       'NestedEq',
-      new Schema({ name: String, processing: new Schema({ status: String }, { _id: false }) })
+      new Schema({ name: String, processing: new Schema({ status: String }) })
     )
     await M.insertMany([
       { name: 'a', processing: { status: 'pending' } },

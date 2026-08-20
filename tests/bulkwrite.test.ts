@@ -102,7 +102,7 @@ test('Model.bulkWrite', async t => {
     assert.strictEqual(second.modifiedCount, 1)
     const doc = await M.findOne({ employeeId: 10 }).lean()
     assert.deepStrictEqual(doc?.raw, { id: 10 })
-    assert.deepStrictEqual([...(doc?.labels ?? [])].sort(), ['cohort-a', 'cohort-b'])
+    assert.deepStrictEqual([...((doc?.labels as string[]) ?? [])].sort(), ['cohort-a', 'cohort-b'])
   })
 
   await t.test('updateMany with upsert inserts when nothing matches', async () => {

@@ -47,7 +47,7 @@ test('Upsert update operators', async t => {
     assert.strictEqual(second.modifiedCount, 1)
     const doc = await M.findOne({ employeeId: 2 }).lean()
     assert.deepStrictEqual(doc?.raw, { original: true })
-    assert.deepStrictEqual([...(doc?.labels ?? [])].sort(), ['a', 'b'])
+    assert.deepStrictEqual([...((doc?.labels as string[]) ?? [])].sort(), ['a', 'b'])
     assert.strictEqual(await M.countDocuments({ employeeId: 2 }), 1)
   })
 

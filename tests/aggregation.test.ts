@@ -476,6 +476,10 @@ describe('Aggregation Pipeline', () => {
   })
 
   describe('$unwind stage', () => {
+    // $unwind rewrites the document around a mixed subtree, so its results are
+    // read back as nested records rather than the model's own shape
+    type UnwoundDoc = Record<string, Record<string, unknown>>
+
     interface OrderInterface {
       customer: string
       items: string[]
@@ -582,7 +586,7 @@ describe('Aggregation Pipeline', () => {
         raw: { country: 'IN', education: [{ school: 'A' }, { school: 'B' }] }
       })
 
-      const results = await Profile.aggregate([{ $unwind: '$raw.education' }])
+      const results = await Profile.aggregate<UnwoundDoc>([{ $unwind: '$raw.education' }])
 
       assert.strictEqual(results.length, 2)
       assert.deepStrictEqual(results[0].raw.education, { school: 'A' })
@@ -602,7 +606,7 @@ describe('Aggregation Pipeline', () => {
         { employeeId: 2, raw: { education: [] } }
       ])
 
-      const results = await Profile.aggregate([
+      const results = await Profile.aggregate<UnwoundDoc>([
         {
           $unwind: {
             path: '$raw.education',
@@ -629,7 +633,7 @@ describe('Aggregation Pipeline', () => {
         { employeeId: 1, raw: { education: [{ school: 'A' }, { school: 'B' }] } }
       ])
 
-      const results = await Profile.aggregate([
+      const results = await Profile.aggregate<UnwoundDoc>([
         { $unwind: { path: '$raw.education', includeArrayIndex: 'raw.eduIdx' } },
         { $match: { 'raw.eduIdx': 0 } }
       ])
@@ -650,7 +654,7 @@ describe('Aggregation Pipeline', () => {
         { employeeId: 3, raw: { education: [] } }
       ])
 
-      const results = await Profile.aggregate([
+      const results = await Profile.aggregate<UnwoundDoc>([
         { $unwind: { path: '$raw.education', preserveNullAndEmptyArrays: true } },
         { $sort: { employeeId: 1 } }
       ])

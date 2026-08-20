@@ -272,7 +272,7 @@ describe('$search aggregation', () => {
     await assert.rejects(
       () =>
         DynamicModel.aggregate([
-          // @ts-expect-error intentional bad stage for runtime validation
+          // intentional bad stage for runtime validation
           { $search: { index: 'dyn', text: { path: 'title' } } }
         ]),
       /text\.path and text\.query/
@@ -281,7 +281,7 @@ describe('$search aggregation', () => {
     await assert.rejects(
       () =>
         DynamicModel.aggregate([
-          // @ts-expect-error intentional bad stage for runtime validation
+          // intentional bad stage for runtime validation
           { $search: { index: 'dyn', text: { query: 'x' } } }
         ]),
       /text\.path and text\.query/
@@ -346,7 +346,7 @@ describe('$search aggregation', () => {
     await assert.rejects(
       () =>
         DynamicModel.aggregate([
-          // @ts-expect-error intentional bad stage for runtime validation
+          // intentional bad stage for runtime validation
           { $search: { index: 'dyn' } }
         ]),
       /text\.path and text\.query/
