@@ -47,7 +47,8 @@ export type { BulkWriteOperation, BulkWriteResult } from './src/model'
 
 // ObjectId
 import { ObjectId as _ObjectId } from './src/objectid'
-export const ObjectId = _ObjectId
+// Exported as a class, not through `export const`, so the type meaning survives
+export { ObjectId } from './src/objectid'
 
 // Types namespace (Mongoose-compatible)
 export const Types = {
