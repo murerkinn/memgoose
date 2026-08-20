@@ -1917,19 +1917,7 @@ export class Model<T extends object = Record<string, unknown>> {
     if (!docToUpdate) {
       // Handle upsert: create document if it doesn't exist
       if (options.upsert) {
-        const newDoc = {} as Record<string, unknown>
-
-        // Apply query fields as initial values
-        for (const [key, value] of Object.entries(query)) {
-          if (typeof value !== 'object' || value === null || value instanceof ObjectId) {
-            newDoc[key] = value
-          }
-        }
-
-        // Apply the update
-        this._applyUpdate(newDoc as T, update)
-
-        // Create the document
+        const newDoc = this._buildUpsertDocument(query, update)
         const created = await this.create(newDoc as DeepPartial<T>)
         return returnBefore ? null : created
       }
@@ -1939,45 +1927,34 @@ export class Model<T extends object = Record<string, unknown>> {
 
     // Save old state for index update
     const oldState = { ...docToUpdate }
+    // returnDocument: 'before' needs a snapshot taken before the in-place update;
+    // otherwise the updated document itself is what gets returned
+    const returned = returnBefore ? (JSON.parse(JSON.stringify(docToUpdate)) as T) : docToUpdate
 
-    if (returnBefore) {
-      const original = JSON.parse(JSON.stringify(docToUpdate)) as T
-      // Validate on a copy first
-      const testCopy = JSON.parse(JSON.stringify(docToUpdate)) as T
-      this._applyUpdate(testCopy, update)
-      this._applyTimestamps(testCopy, 'update')
-      await this._validateDocument(testCopy)
-      this._checkUniqueConstraints(testCopy, docToUpdate)
-      // If valid, apply to original
-      this._applyUpdate(docToUpdate, update)
-      this._applyTimestamps(docToUpdate, 'update')
-      // Efficiently update indexes for this single document
-      this._updateIndexForDocument(oldState, docToUpdate)
-      // Apply virtuals unless lean mode
-      let result: T & Document = isLean ? (original as T & Document) : this._applyVirtuals(original)
-      // Apply field selection if specified
-      if (options.select) {
-        result = this._applyFieldSelection(result, options.select) as T & Document
-      }
-      return result
-    }
-
-    // Return after (default or when new: true)
     // Validate on a copy first
     const testCopy = JSON.parse(JSON.stringify(docToUpdate)) as T
     this._applyUpdate(testCopy, update)
     this._applyTimestamps(testCopy, 'update')
     await this._validateDocument(testCopy)
     this._checkUniqueConstraints(testCopy, docToUpdate)
+
     // If valid, apply to original
-    this._applyUpdate(docToUpdate, update)
+    const modified = this._applyUpdate(docToUpdate, update)
     this._applyTimestamps(docToUpdate, 'update')
-    // Efficiently update indexes for this single document
-    this._updateIndexForDocument(oldState, docToUpdate)
+
+    // An update that modifies nothing still bumps updatedAt, so it still has to be
+    // written; with no timestamps to bump either the document is untouched, and a
+    // get-or-create findOneAndUpdate would otherwise rewrite the row on every hit
+    if (modified || this._schema?.getTimestampConfig()) {
+      // Persist changes to storage
+      await this._storage.update(docToUpdate, docToUpdate)
+
+      // Efficiently update indexes for this single document
+      this._updateIndexForDocument(oldState, docToUpdate)
+    }
+
     // Apply virtuals unless lean mode
-    let result: T & Document = isLean
-      ? (docToUpdate as T & Document)
-      : this._applyVirtuals(docToUpdate)
+    let result: T & Document = isLean ? (returned as T & Document) : this._applyVirtuals(returned)
     // Apply field selection if specified
     if (options.select) {
       result = this._applyFieldSelection(result, options.select) as T & Document
